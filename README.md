@@ -1,52 +1,110 @@
-# Personal Fitness Tracker
+# Personal Fitness Tracker (Supabase)
 
-Beginner-friendly local app to track:
+This app now uses Supabase (Postgres) so your data persists and syncs across devices (laptop + iPhone web app).
 
-- Food by grams
-- Running totals for calories, protein, carbs, and fat
-- Weight, body fat %, and steps
+## 1) Supabase setup
 
-The app runs locally and stores data in SQLite (`fitness_tracker.db`).
+Create a Supabase project, then run this SQL in Supabase SQL Editor:
 
-## Setup
+```sql
+create table if not exists daily_entries (
+  entry_date date primary key,
+  weight_lbs numeric,
+  body_fat_pct numeric,
+  steps integer,
+  calories integer,
+  food_notes text,
+  created_at timestamptz default now(),
+  updated_at timestamptz default now()
+);
+
+create table if not exists foods (
+  id bigint generated always as identity primary key,
+  name text unique not null,
+  category text not null,
+  grams_per_serving numeric not null,
+  cals_per_serving numeric not null,
+  protein_per_serving numeric not null,
+  carbs_per_serving numeric not null,
+  fat_per_serving numeric not null,
+  input_mode text not null default 'grams',
+  unit_label text not null default 'serving',
+  units_per_serving numeric not null default 1,
+  created_at timestamptz default now()
+);
+
+create table if not exists food_logs (
+  id bigint generated always as identity primary key,
+  entry_date date not null,
+  food_id bigint not null references foods(id) on delete cascade,
+  grams numeric not null,
+  servings numeric not null,
+  cals numeric not null,
+  protein numeric not null,
+  carbs numeric not null,
+  fat numeric not null,
+  notes text,
+  created_at timestamptz default now()
+);
+
+create table if not exists macro_goals (
+  id integer primary key,
+  goal_name text not null,
+  target_cals numeric not null,
+  target_protein numeric not null,
+  target_carbs numeric not null,
+  target_fat numeric not null,
+  body_weight numeric,
+  body_fat_pct numeric,
+  bmr numeric,
+  daily_activity numeric,
+  updated_at timestamptz default now()
+);
+```
+
+## 2) Add local secrets
+
+Create `.streamlit/secrets.toml` in this project:
+
+```toml
+SUPABASE_URL = "https://YOUR_PROJECT_ID.supabase.co"
+SUPABASE_ANON_KEY = "YOUR_SUPABASE_ANON_KEY"
+```
+
+## 3) Install + run
 
 ```bash
-cd "/Users/frankmperalta/Documents/New project"
+cd "/Users/frankmperalta/Desktop/New project"
 python3 -m venv .venv
 source .venv/bin/activate
-pip install -r requirements.txt
+python3 -m pip install -r requirements.txt
+python3 -m streamlit run app.py
 ```
 
-## Run
+## 4) Migrate your existing local SQLite data (optional)
+
+If you already have data in `fitness_tracker.db`:
 
 ```bash
-streamlit run app.py
+python3 migrate_sqlite_to_supabase.py
 ```
+
+This will copy:
+- foods
+- daily_entries
+- food_logs
 
 ## Main Pages
 
-- `Food Log`: choose food, enter grams or quantity (for count-based foods like eggs/scoops), app calculates macros and keeps running daily totals.
-- `Manage Foods`: add custom foods with serving-size macros and choose input mode (`grams` or `quantity`).
-- `Body Metrics`: log weight/body-fat/steps.
-- `Dashboard`: trend charts for body metrics and daily macro totals.
-- `Export`: export body metrics and daily macro totals as CSV.
+- `Food Log`: log foods by grams or quantity (eggs, scoops, slices).
+- `Manage Foods`: add custom foods and choose input mode.
+- `Body Metrics`: weight, body-fat, steps.
+- `Macro Calculator`: maintenance/deficit planning.
+- `Dashboard`: trends and daily macro totals.
+- `Import CSV`: import body metrics.
+- `Export`: export body metrics + daily macro totals.
 
-## Food Library
 
-The app is pre-seeded with starter foods from your current tracker table and allows custom foods.
+## Goal Tracking
 
-For each food, you can store:
-
-- Name
-- Category
-- Grams per serving
-- Calories per serving
-- Protein per serving
-- Carbs per serving
-- Fat per serving
-
-## Notes
-
-- If you log the same food multiple times in a day, totals accumulate.
-- You can delete incorrect food log entries from the `Food Log` page.
-- CSV import currently targets body metrics only.
+Macro goals are now saved from `Macro Calculator` into `macro_goals` and used in `Dashboard` and `Food Log` for goal-vs-actual progress.

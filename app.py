@@ -1,12 +1,12 @@
-import sqlite3
-from datetime import date
-from pathlib import Path
+from __future__ import annotations
+
+import os
+from datetime import date, datetime, timezone
 
 import pandas as pd
 import plotly.express as px
 import streamlit as st
-
-DB_PATH = Path("fitness_tracker.db")
+from supabase import Client, create_client
 
 ALIASES = {
     "date": ["date", "day"],
@@ -16,7 +16,6 @@ ALIASES = {
     "calories": ["calories", "kcal", "cals", "total_calories", "total calories"],
     "food_notes": ["food_notes", "food", "notes", "food note", "meal_notes", "meals"],
 }
-
 
 DEFAULT_FOODS = [
     {"name": "Eggs", "category": "Protein", "grams_per_serving": 50, "cals": 70, "protein": 6, "carbs": 1, "fat": 5},
@@ -56,63 +55,25 @@ DEFAULT_FOODS = [
 ]
 
 
-def get_conn() -> sqlite3.Connection:
-    return sqlite3.connect(DB_PATH)
+@st.cache_resource
+def get_supabase_client() -> Client:
+    url = st.secrets.get("SUPABASE_URL") if "SUPABASE_URL" in st.secrets else os.getenv("SUPABASE_URL")
+    key = st.secrets.get("SUPABASE_ANON_KEY") if "SUPABASE_ANON_KEY" in st.secrets else os.getenv("SUPABASE_ANON_KEY")
+
+    if not url or not key:
+        raise RuntimeError("Missing SUPABASE_URL or SUPABASE_ANON_KEY")
+    return create_client(url, key)
 
 
-def init_db() -> None:
-    with get_conn() as conn:
-        conn.execute(
-            """
-            CREATE TABLE IF NOT EXISTS daily_entries (
-                entry_date TEXT PRIMARY KEY,
-                weight_lbs REAL,
-                body_fat_pct REAL,
-                steps INTEGER,
-                calories INTEGER,
-                food_notes TEXT,
-                created_at TEXT DEFAULT CURRENT_TIMESTAMP,
-                updated_at TEXT DEFAULT CURRENT_TIMESTAMP
-            )
-            """
+def require_supabase() -> Client | None:
+    try:
+        return get_supabase_client()
+    except Exception:
+        st.error("Supabase is not configured.")
+        st.code(
+            """In Streamlit secrets (or local env), set:\nSUPABASE_URL=...\nSUPABASE_ANON_KEY=..."""
         )
-        conn.execute(
-            """
-            CREATE TABLE IF NOT EXISTS foods (
-                id INTEGER PRIMARY KEY AUTOINCREMENT,
-                name TEXT UNIQUE NOT NULL,
-                category TEXT NOT NULL,
-                grams_per_serving REAL NOT NULL,
-                cals_per_serving REAL NOT NULL,
-                protein_per_serving REAL NOT NULL,
-                carbs_per_serving REAL NOT NULL,
-                fat_per_serving REAL NOT NULL,
-                input_mode TEXT NOT NULL DEFAULT 'grams',
-                unit_label TEXT NOT NULL DEFAULT 'serving',
-                units_per_serving REAL NOT NULL DEFAULT 1,
-                created_at TEXT DEFAULT CURRENT_TIMESTAMP
-            )
-            """
-        )
-        ensure_foods_schema(conn)
-        conn.execute(
-            """
-            CREATE TABLE IF NOT EXISTS food_logs (
-                id INTEGER PRIMARY KEY AUTOINCREMENT,
-                entry_date TEXT NOT NULL,
-                food_id INTEGER NOT NULL,
-                grams REAL NOT NULL,
-                servings REAL NOT NULL,
-                cals REAL NOT NULL,
-                protein REAL NOT NULL,
-                carbs REAL NOT NULL,
-                fat REAL NOT NULL,
-                notes TEXT,
-                created_at TEXT DEFAULT CURRENT_TIMESTAMP,
-                FOREIGN KEY(food_id) REFERENCES foods(id)
-            )
-            """
-        )
+        return None
 
 
 def default_food_input_config(food_name: str) -> tuple[str, str, float]:
@@ -130,64 +91,26 @@ def default_food_input_config(food_name: str) -> tuple[str, str, float]:
     return ("grams", "serving", 1.0)
 
 
-def ensure_foods_schema(conn: sqlite3.Connection) -> None:
-    cols = {row[1] for row in conn.execute("PRAGMA table_info(foods)").fetchall()}
-    if "input_mode" not in cols:
-        conn.execute("ALTER TABLE foods ADD COLUMN input_mode TEXT NOT NULL DEFAULT 'grams'")
-    if "unit_label" not in cols:
-        conn.execute("ALTER TABLE foods ADD COLUMN unit_label TEXT NOT NULL DEFAULT 'serving'")
-    if "units_per_serving" not in cols:
-        conn.execute("ALTER TABLE foods ADD COLUMN units_per_serving REAL NOT NULL DEFAULT 1")
+def seed_default_foods(client: Client) -> None:
+    rows = []
+    for food in DEFAULT_FOODS:
+        mode, unit_label, units_per_serving = default_food_input_config(food["name"])
+        rows.append(
+            {
+                "name": food["name"],
+                "category": food["category"],
+                "grams_per_serving": food["grams_per_serving"],
+                "cals_per_serving": food["cals"],
+                "protein_per_serving": food["protein"],
+                "carbs_per_serving": food["carbs"],
+                "fat_per_serving": food["fat"],
+                "input_mode": mode,
+                "unit_label": unit_label,
+                "units_per_serving": units_per_serving,
+            }
+        )
 
-    # Set quantity-based defaults for common count-based foods.
-    conn.execute(
-        """
-        UPDATE foods
-        SET input_mode='quantity', unit_label='egg', units_per_serving=1
-        WHERE lower(name)='eggs'
-        """
-    )
-    conn.execute(
-        """
-        UPDATE foods
-        SET input_mode='quantity', unit_label='serving', units_per_serving=1
-        WHERE lower(name)='egg whites'
-        """
-    )
-    conn.execute(
-        """
-        UPDATE foods
-        SET input_mode='quantity', unit_label='scoop', units_per_serving=1
-        WHERE lower(name) LIKE '%protein shake%'
-        """
-    )
-
-
-def seed_default_foods() -> None:
-    with get_conn() as conn:
-        for food in DEFAULT_FOODS:
-            conn.execute(
-                """
-                INSERT INTO foods (
-                    name, category, grams_per_serving, cals_per_serving,
-                    protein_per_serving, carbs_per_serving, fat_per_serving,
-                    input_mode, unit_label, units_per_serving
-                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-                ON CONFLICT(name) DO NOTHING
-                """,
-                (
-                    food["name"],
-                    food["category"],
-                    food["grams_per_serving"],
-                    food["cals"],
-                    food["protein"],
-                    food["carbs"],
-                    food["fat"],
-                    default_food_input_config(food["name"])[0],
-                    default_food_input_config(food["name"])[1],
-                    default_food_input_config(food["name"])[2],
-                ),
-            )
+    client.table("foods").upsert(rows, on_conflict="name").execute()
 
 
 def normalize_import_columns(df: pd.DataFrame) -> pd.DataFrame:
@@ -224,6 +147,7 @@ def normalize_import_columns(df: pd.DataFrame) -> pd.DataFrame:
 
 
 def upsert_daily_entry(
+    client: Client,
     entry_date: date,
     weight_lbs: float | None,
     body_fat_pct: float | None,
@@ -231,136 +155,162 @@ def upsert_daily_entry(
     calories: int | None,
     food_notes: str,
 ) -> None:
-    with get_conn() as conn:
-        conn.execute(
-            """
-            INSERT INTO daily_entries (entry_date, weight_lbs, body_fat_pct, steps, calories, food_notes)
-            VALUES (?, ?, ?, ?, ?, ?)
-            ON CONFLICT(entry_date) DO UPDATE SET
-                weight_lbs=excluded.weight_lbs,
-                body_fat_pct=excluded.body_fat_pct,
-                steps=excluded.steps,
-                calories=excluded.calories,
-                food_notes=excluded.food_notes,
-                updated_at=CURRENT_TIMESTAMP
-            """,
-            (
-                entry_date.isoformat(),
-                weight_lbs,
-                body_fat_pct,
-                steps,
-                calories,
-                food_notes,
-            ),
-        )
+    payload = {
+        "entry_date": entry_date.isoformat(),
+        "weight_lbs": weight_lbs,
+        "body_fat_pct": body_fat_pct,
+        "steps": steps,
+        "calories": calories,
+        "food_notes": food_notes,
+        "updated_at": datetime.now(timezone.utc).isoformat(),
+    }
+    client.table("daily_entries").upsert(payload, on_conflict="entry_date").execute()
 
 
-def fetch_daily_entries() -> pd.DataFrame:
-    with get_conn() as conn:
-        df = pd.read_sql_query(
-            """
-            SELECT entry_date as date, weight_lbs, body_fat_pct, steps, calories, food_notes
-            FROM daily_entries
-            ORDER BY entry_date
-            """,
-            conn,
-        )
+def fetch_daily_entries(client: Client) -> pd.DataFrame:
+    data = (
+        client.table("daily_entries")
+        .select("entry_date, weight_lbs, body_fat_pct, steps, calories, food_notes")
+        .order("entry_date")
+        .execute()
+        .data
+        or []
+    )
+    if not data:
+        return pd.DataFrame(columns=["date", "weight_lbs", "body_fat_pct", "steps", "calories", "food_notes"])
 
-    if df.empty:
-        return df
-
+    df = pd.DataFrame(data).rename(columns={"entry_date": "date"})
     df["date"] = pd.to_datetime(df["date"])
     return df
 
 
-def fetch_foods() -> pd.DataFrame:
-    with get_conn() as conn:
-        return pd.read_sql_query(
-            """
-            SELECT id, name, category, grams_per_serving, cals_per_serving,
-                   protein_per_serving, carbs_per_serving, fat_per_serving,
-                   input_mode, unit_label, units_per_serving
-            FROM foods
-            ORDER BY category, name
-            """,
-            conn,
+def fetch_foods(client: Client) -> pd.DataFrame:
+    data = (
+        client.table("foods")
+        .select(
+            "id, name, category, grams_per_serving, cals_per_serving, protein_per_serving, "
+            "carbs_per_serving, fat_per_serving, input_mode, unit_label, units_per_serving"
         )
+        .order("category")
+        .order("name")
+        .execute()
+        .data
+        or []
+    )
+
+    cols = [
+        "id",
+        "name",
+        "category",
+        "grams_per_serving",
+        "cals_per_serving",
+        "protein_per_serving",
+        "carbs_per_serving",
+        "fat_per_serving",
+        "input_mode",
+        "unit_label",
+        "units_per_serving",
+    ]
+    if not data:
+        return pd.DataFrame(columns=cols)
+    return pd.DataFrame(data)
 
 
-def log_food_entry(entry_date: date, food_id: int, grams: float, notes: str) -> None:
-    with get_conn() as conn:
-        food = conn.execute(
-            """
-            SELECT grams_per_serving, cals_per_serving, protein_per_serving,
-                   carbs_per_serving, fat_per_serving
-            FROM foods
-            WHERE id = ?
-            """,
-            (food_id,),
-        ).fetchone()
+def log_food_entry(client: Client, entry_date: date, food_id: int, grams: float, notes: str) -> None:
+    rows = (
+        client.table("foods")
+        .select("grams_per_serving, cals_per_serving, protein_per_serving, carbs_per_serving, fat_per_serving")
+        .eq("id", food_id)
+        .limit(1)
+        .execute()
+        .data
+        or []
+    )
+    if not rows:
+        raise ValueError("Food not found")
 
-        if not food:
-            raise ValueError("Food not found")
+    food = rows[0]
+    grams_per_serving = float(food["grams_per_serving"])
+    servings = grams / grams_per_serving if grams_per_serving > 0 else 0
 
-        grams_per_serving, cals_ps, pro_ps, carb_ps, fat_ps = food
-        servings = grams / grams_per_serving if grams_per_serving > 0 else 0
-        cals = servings * cals_ps
-        pro = servings * pro_ps
-        carbs = servings * carb_ps
-        fat = servings * fat_ps
+    payload = {
+        "entry_date": entry_date.isoformat(),
+        "food_id": int(food_id),
+        "grams": float(grams),
+        "servings": float(servings),
+        "cals": float(servings * float(food["cals_per_serving"])),
+        "protein": float(servings * float(food["protein_per_serving"])),
+        "carbs": float(servings * float(food["carbs_per_serving"])),
+        "fat": float(servings * float(food["fat_per_serving"])),
+        "notes": notes,
+    }
 
-        conn.execute(
-            """
-            INSERT INTO food_logs (entry_date, food_id, grams, servings, cals, protein, carbs, fat, notes)
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
-            """,
-            (entry_date.isoformat(), food_id, grams, servings, cals, pro, carbs, fat, notes),
-        )
-
-
-def fetch_food_logs(entry_date: date) -> pd.DataFrame:
-    with get_conn() as conn:
-        df = pd.read_sql_query(
-            """
-            SELECT fl.id, f.name, f.category, fl.grams, fl.servings, fl.cals, fl.protein, fl.carbs, fl.fat, fl.notes
-            FROM food_logs fl
-            JOIN foods f ON f.id = fl.food_id
-            WHERE fl.entry_date = ?
-            ORDER BY fl.id DESC
-            """,
-            conn,
-            params=(entry_date.isoformat(),),
-        )
-    return df
+    client.table("food_logs").insert(payload).execute()
 
 
-def delete_food_log(log_id: int) -> None:
-    with get_conn() as conn:
-        conn.execute("DELETE FROM food_logs WHERE id = ?", (log_id,))
+def fetch_food_logs(client: Client, entry_date: date) -> pd.DataFrame:
+    logs = (
+        client.table("food_logs")
+        .select("id, food_id, grams, servings, cals, protein, carbs, fat, notes")
+        .eq("entry_date", entry_date.isoformat())
+        .order("id", desc=True)
+        .execute()
+        .data
+        or []
+    )
+    if not logs:
+        return pd.DataFrame(columns=["id", "name", "category", "grams", "servings", "cals", "protein", "carbs", "fat", "notes"])
+
+    logs_df = pd.DataFrame(logs)
+    food_ids = logs_df["food_id"].dropna().astype(int).unique().tolist()
+
+    foods = (
+        client.table("foods")
+        .select("id, name, category")
+        .in_("id", food_ids)
+        .execute()
+        .data
+        or []
+    )
+    foods_df = pd.DataFrame(foods)
+
+    merged = logs_df.merge(foods_df, left_on="food_id", right_on="id", how="left", suffixes=("", "_food"))
+    merged = merged[["id", "name", "category", "grams", "servings", "cals", "protein", "carbs", "fat", "notes"]]
+    return merged
 
 
-def fetch_daily_macro_totals() -> pd.DataFrame:
-    with get_conn() as conn:
-        df = pd.read_sql_query(
-            """
-            SELECT entry_date as date,
-                   ROUND(SUM(cals), 2) AS cals,
-                   ROUND(SUM(protein), 2) AS protein,
-                   ROUND(SUM(carbs), 2) AS carbs,
-                   ROUND(SUM(fat), 2) AS fat
-            FROM food_logs
-            GROUP BY entry_date
-            ORDER BY entry_date
-            """,
-            conn,
-        )
-    if df.empty:
-        return df
-    df["date"] = pd.to_datetime(df["date"])
-    return df
+def delete_food_log(client: Client, log_id: int) -> None:
+    client.table("food_logs").delete().eq("id", log_id).execute()
+
+
+def fetch_daily_macro_totals(client: Client) -> pd.DataFrame:
+    logs = (
+        client.table("food_logs")
+        .select("entry_date, cals, protein, carbs, fat")
+        .order("entry_date")
+        .execute()
+        .data
+        or []
+    )
+
+    if not logs:
+        return pd.DataFrame(columns=["date", "cals", "protein", "carbs", "fat"])
+
+    df = pd.DataFrame(logs).rename(columns={"entry_date": "date"})
+    for col in ["cals", "protein", "carbs", "fat"]:
+        df[col] = pd.to_numeric(df[col], errors="coerce").fillna(0)
+
+    grouped = (
+        df.groupby("date", as_index=False)[["cals", "protein", "carbs", "fat"]]
+        .sum()
+        .sort_values("date")
+    )
+    grouped["date"] = pd.to_datetime(grouped["date"])
+    return grouped
 
 
 def add_food(
+    client: Client,
     name: str,
     category: str,
     grams_per_serving: float,
@@ -372,46 +322,45 @@ def add_food(
     unit_label: str,
     units_per_serving: float,
 ) -> None:
-    with get_conn() as conn:
-        conn.execute(
-            """
-            INSERT INTO foods (
-                name, category, grams_per_serving, cals_per_serving,
-                protein_per_serving, carbs_per_serving, fat_per_serving,
-                input_mode, unit_label, units_per_serving
-            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-            """,
-            (
-                name.strip(),
-                category,
-                grams_per_serving,
-                cals_per_serving,
-                protein_per_serving,
-                carbs_per_serving,
-                fat_per_serving,
-                input_mode,
-                unit_label.strip() or "serving",
-                units_per_serving,
-            ),
-        )
+    client.table("foods").insert(
+        {
+            "name": name.strip(),
+            "category": category,
+            "grams_per_serving": grams_per_serving,
+            "cals_per_serving": cals_per_serving,
+            "protein_per_serving": protein_per_serving,
+            "carbs_per_serving": carbs_per_serving,
+            "fat_per_serving": fat_per_serving,
+            "input_mode": input_mode,
+            "unit_label": unit_label.strip() or "serving",
+            "units_per_serving": units_per_serving,
+        }
+    ).execute()
 
 
-def import_rows(df: pd.DataFrame) -> int:
-    imported = 0
+def import_rows(client: Client, df: pd.DataFrame) -> int:
+    rows = []
     for _, row in df.iterrows():
-        upsert_daily_entry(
-            entry_date=row["date"],
-            weight_lbs=None if pd.isna(row["weight_lbs"]) else float(row["weight_lbs"]),
-            body_fat_pct=None if pd.isna(row["body_fat_pct"]) else float(row["body_fat_pct"]),
-            steps=None if pd.isna(row["steps"]) else int(row["steps"]),
-            calories=None if pd.isna(row["calories"]) else int(row["calories"]),
-            food_notes=row["food_notes"],
+        rows.append(
+            {
+                "entry_date": row["date"].isoformat(),
+                "weight_lbs": None if pd.isna(row["weight_lbs"]) else float(row["weight_lbs"]),
+                "body_fat_pct": None if pd.isna(row["body_fat_pct"]) else float(row["body_fat_pct"]),
+                "steps": None if pd.isna(row["steps"]) else int(row["steps"]),
+                "calories": None if pd.isna(row["calories"]) else int(row["calories"]),
+                "food_notes": row["food_notes"],
+                "updated_at": datetime.now(timezone.utc).isoformat(),
+            }
         )
-        imported += 1
-    return imported
+
+    if rows:
+        client.table("daily_entries").upsert(rows, on_conflict="entry_date").execute()
+    return len(rows)
 
 
 def latest_metric(df: pd.DataFrame, col: str):
+    if df.empty:
+        return None
     non_null = df.dropna(subset=[col])
     if non_null.empty:
         return None
@@ -458,19 +407,127 @@ def macro_breakdown(total_cals: float, body_weight: float, protein_ratio: float,
     }
 
 
-def render_dashboard(daily_df: pd.DataFrame, macro_df: pd.DataFrame) -> None:
+def fetch_active_macro_goal(client: Client) -> dict | None:
+    try:
+        rows = (
+            client.table("macro_goals")
+            .select(
+                "id, goal_name, target_cals, target_protein, target_carbs, target_fat, "
+                "body_weight, body_fat_pct, bmr, daily_activity, updated_at"
+            )
+            .eq("id", 1)
+            .limit(1)
+            .execute()
+            .data
+            or []
+        )
+    except Exception:
+        return None
+
+    return rows[0] if rows else None
+
+
+def save_active_macro_goal(
+    client: Client,
+    goal_name: str,
+    target_cals: float,
+    target_protein: float,
+    target_carbs: float,
+    target_fat: float,
+    body_weight: float,
+    body_fat_pct: float,
+    bmr: float,
+    daily_activity: float,
+) -> None:
+    payload = {
+        "id": 1,
+        "goal_name": goal_name,
+        "target_cals": target_cals,
+        "target_protein": target_protein,
+        "target_carbs": target_carbs,
+        "target_fat": target_fat,
+        "body_weight": body_weight,
+        "body_fat_pct": body_fat_pct,
+        "bmr": bmr,
+        "daily_activity": daily_activity,
+        "updated_at": datetime.now(timezone.utc).isoformat(),
+    }
+    client.table("macro_goals").upsert(payload, on_conflict="id").execute()
+
+
+def totals_for_date(macro_df: pd.DataFrame, target_date: date) -> dict:
+    if macro_df.empty:
+        return {"cals": 0.0, "protein": 0.0, "carbs": 0.0, "fat": 0.0}
+
+    day_rows = macro_df[macro_df["date"].dt.date == target_date]
+    if day_rows.empty:
+        return {"cals": 0.0, "protein": 0.0, "carbs": 0.0, "fat": 0.0}
+
+    row = day_rows.iloc[-1]
+    return {
+        "cals": float(row["cals"]),
+        "protein": float(row["protein"]),
+        "carbs": float(row["carbs"]),
+        "fat": float(row["fat"]),
+    }
+
+
+def render_goals_vs_actual(actual: dict, goals: dict, section_title: str) -> None:
+    st.markdown(f"### {section_title}")
+
+    metrics = [
+        ("Calories", "cals", "target_cals", "kcal"),
+        ("Protein", "protein", "target_protein", "g"),
+        ("Carbs", "carbs", "target_carbs", "g"),
+        ("Fat", "fat", "target_fat", "g"),
+    ]
+
+    cols = st.columns(4)
+    for col, (label, a_key, g_key, unit) in zip(cols, metrics):
+        actual_val = float(actual.get(a_key, 0.0))
+        goal_val = float(goals.get(g_key, 0.0) or 0.0)
+        pct = (actual_val / goal_val * 100.0) if goal_val > 0 else 0.0
+
+        with col:
+            if label == "Calories" and goal_val > 0:
+                delta = goal_val - actual_val
+                delta_text = f"{delta:.0f} remaining"
+                st.metric(label, f"{actual_val:.0f} / {goal_val:.0f}", delta=delta_text)
+                color = "#16a34a" if actual_val <= goal_val else "#dc2626"
+                status = "Under/On Target" if actual_val <= goal_val else "Over Target"
+                st.markdown(
+                    f"<span style='color:{color};font-weight:600'>{status}</span>",
+                    unsafe_allow_html=True,
+                )
+            else:
+                st.metric(label, f"{actual_val:.1f}{unit} / {goal_val:.1f}{unit}" if goal_val > 0 else f"{actual_val:.1f}{unit}")
+
+            st.caption(f"{pct:.1f}% of goal" if goal_val > 0 else "No goal set")
+            if goal_val > 0:
+                st.progress(min(pct / 100.0, 1.0))
+
+
+def render_dashboard(daily_df: pd.DataFrame, macro_df: pd.DataFrame, active_goal: dict | None) -> None:
     st.subheader("Dashboard")
 
     c1, c2, c3, c4 = st.columns(4)
-    lw = latest_metric(daily_df, "weight_lbs") if not daily_df.empty else None
-    lbf = latest_metric(daily_df, "body_fat_pct") if not daily_df.empty else None
-    ls = latest_metric(daily_df, "steps") if not daily_df.empty else None
-    lc = latest_metric(macro_df, "cals") if not macro_df.empty else None
+    lw = latest_metric(daily_df, "weight_lbs")
+    lbf = latest_metric(daily_df, "body_fat_pct")
+    ls = latest_metric(daily_df, "steps")
+    lc = latest_metric(macro_df, "cals")
 
     c1.metric("Latest Weight", "-" if lw is None else f"{lw:.1f} lbs")
     c2.metric("Latest Body Fat", "-" if lbf is None else f"{lbf:.1f}%")
     c3.metric("Latest Steps", "-" if ls is None else f"{int(ls):,}")
     c4.metric("Latest Food Cals", "-" if lc is None else f"{int(lc):,}")
+
+    compare_date = st.date_input("Goal Comparison Date", value=date.today(), key="dashboard_compare_date")
+    if active_goal:
+        actual = totals_for_date(macro_df, compare_date)
+        goal_name = active_goal.get("goal_name", "Current Goal")
+        render_goals_vs_actual(actual, active_goal, f"{goal_name}: {compare_date.isoformat()}")
+    else:
+        st.info("No saved macro goal yet. Save one from Macro Calculator to enable goal comparison.")
 
     if not daily_df.empty:
         for col in ["weight_lbs", "body_fat_pct", "steps"]:
@@ -485,10 +542,10 @@ def render_dashboard(daily_df: pd.DataFrame, macro_df: pd.DataFrame) -> None:
             st.plotly_chart(fig, use_container_width=True)
 
     if daily_df.empty and macro_df.empty:
-        st.info("No data yet. Start in Food Log and Add / Edit Entry.")
+        st.info("No data yet. Start in Food Log and Body Metrics.")
 
 
-def render_food_log(foods_df: pd.DataFrame) -> None:
+def render_food_log(client: Client, foods_df: pd.DataFrame, macro_df: pd.DataFrame, active_goal: dict | None) -> None:
     st.subheader("Food Log")
     log_date = st.date_input("Date", value=date.today(), key="food_log_date")
 
@@ -504,41 +561,37 @@ def render_food_log(foods_df: pd.DataFrame) -> None:
         return f"{r['name']} ({r['category']}) - {r['grams_per_serving']}g serving"
 
     foods_df["label"] = foods_df.apply(label_food, axis=1)
+    selected = st.selectbox("Food", options=foods_df["label"].tolist())
+    selected_food = foods_df.loc[foods_df["label"] == selected].iloc[0]
 
-    with st.form("food_log_form"):
-        selected = st.selectbox("Food", options=foods_df["label"].tolist())
-        selected_food = foods_df.loc[foods_df["label"] == selected].iloc[0]
+    if selected_food["input_mode"] == "quantity":
+        amount = st.number_input(
+            f"Quantity eaten ({selected_food['unit_label']})",
+            min_value=0.0,
+            value=0.0,
+            step=1.0,
+        )
+    else:
+        amount = st.number_input("Grams eaten", min_value=0.0, value=0.0, step=1.0)
 
-        amount = 0.0
-        if selected_food["input_mode"] == "quantity":
-            amount = st.number_input(
-                f"Quantity eaten ({selected_food['unit_label']})",
-                min_value=0.0,
-                value=0.0,
-                step=1.0,
-            )
-        else:
-            amount = st.number_input("Grams eaten", min_value=0.0, value=0.0, step=1.0)
+    notes = st.text_input("Notes (optional)")
 
-        notes = st.text_input("Notes (optional)")
-        submit = st.form_submit_button("Add Food")
-
-    if submit:
+    if st.button("Add Food"):
         if amount <= 0:
             st.error("Amount must be greater than 0.")
         else:
             food_id = int(selected_food["id"])
             grams_to_log = float(amount)
-
             if selected_food["input_mode"] == "quantity":
                 units_per_serving = float(selected_food["units_per_serving"] or 1)
                 servings = float(amount) / units_per_serving
                 grams_to_log = servings * float(selected_food["grams_per_serving"])
 
-            log_food_entry(log_date, food_id, grams_to_log, notes)
+            log_food_entry(client, log_date, food_id, grams_to_log, notes)
             st.success("Food entry added.")
+            st.rerun()
 
-    logs_df = fetch_food_logs(log_date)
+    logs_df = fetch_food_logs(client, log_date)
 
     st.markdown("### Running Totals")
     if logs_df.empty:
@@ -561,6 +614,13 @@ def render_food_log(foods_df: pd.DataFrame) -> None:
     c3.metric("Carbs", f"{total_carb:.1f} g")
     c4.metric("Fat", f"{total_fat:.1f} g")
 
+    if active_goal:
+        actual = {"cals": total_cals, "protein": total_pro, "carbs": total_carb, "fat": total_fat}
+        goal_name = active_goal.get("goal_name", "Current Goal")
+        render_goals_vs_actual(actual, active_goal, f"{goal_name}: {log_date.isoformat()}")
+    else:
+        st.info("No saved macro goal yet. Save one from Macro Calculator to compare daily totals.")
+
     st.markdown("### Entries")
     display = logs_df.copy()
     for col in ["grams", "servings", "cals", "protein", "carbs", "fat"]:
@@ -570,12 +630,12 @@ def render_food_log(foods_df: pd.DataFrame) -> None:
     delete_options = {f"#{int(r.id)} - {r.name} ({r.servings:.2f} servings)": int(r.id) for _, r in logs_df.iterrows()}
     selected_delete = st.selectbox("Delete an entry", options=["None"] + list(delete_options.keys()))
     if selected_delete != "None" and st.button("Delete Selected Entry"):
-        delete_food_log(delete_options[selected_delete])
-        st.success("Entry deleted. Refreshing...")
+        delete_food_log(client, delete_options[selected_delete])
+        st.success("Entry deleted.")
         st.rerun()
 
 
-def render_manage_foods(foods_df: pd.DataFrame) -> None:
+def render_manage_foods(client: Client, foods_df: pd.DataFrame) -> None:
     st.subheader("Manage Foods")
     st.caption("Add custom foods with macros per serving. These become selectable in Food Log.")
 
@@ -611,22 +671,34 @@ def render_manage_foods(foods_df: pd.DataFrame) -> None:
             st.error("Food name is required.")
         else:
             try:
-                add_food(name, category, grams_per_serving, cals, pro, carbs, fat, input_mode, unit_label, units_per_serving)
+                add_food(client, name, category, grams_per_serving, cals, pro, carbs, fat, input_mode, unit_label, units_per_serving)
                 st.success(f"Added '{name}'.")
                 st.rerun()
-            except sqlite3.IntegrityError:
-                st.error("A food with that name already exists.")
+            except Exception as exc:
+                msg = str(exc)
+                if "duplicate key" in msg.lower() or "23505" in msg:
+                    st.error("A food with that name already exists.")
+                else:
+                    st.error(f"Could not add food: {msg}")
 
     st.markdown("### Current Food Library")
     show_cols = [
-        "name", "category", "input_mode", "unit_label", "units_per_serving",
-        "grams_per_serving", "cals_per_serving", "protein_per_serving", "carbs_per_serving", "fat_per_serving",
+        "name",
+        "category",
+        "input_mode",
+        "unit_label",
+        "units_per_serving",
+        "grams_per_serving",
+        "cals_per_serving",
+        "protein_per_serving",
+        "carbs_per_serving",
+        "fat_per_serving",
     ]
     display = foods_df[show_cols].copy() if not foods_df.empty else foods_df
     st.dataframe(display, use_container_width=True)
 
 
-def render_add_entry() -> None:
+def render_add_entry(client: Client) -> None:
     st.subheader("Body Metrics")
     st.caption("One row per day. Saving a date again updates that day.")
 
@@ -662,23 +734,28 @@ def render_add_entry() -> None:
             st.error(f"Please correct invalid fields: {', '.join(invalid)}")
             return
 
-        upsert_daily_entry(
-            entry_date=entry_date,
-            weight_lbs=weight_lbs,
-            body_fat_pct=body_fat_pct,
-            steps=steps,
-            calories=calories,
-            food_notes=food_notes,
-        )
+        upsert_daily_entry(client, entry_date, weight_lbs, body_fat_pct, steps, calories, food_notes)
         st.success(f"Saved body metrics for {entry_date.isoformat()}.")
 
 
-def render_macro_calculator(daily_df: pd.DataFrame) -> None:
+def render_macro_calculator(client: Client, daily_df: pd.DataFrame, active_goal: dict | None) -> None:
     st.subheader("Macro Calculator")
     st.caption("Weight-based calorie and macro targets for maintenance and deficit.")
 
-    latest_weight = latest_metric(daily_df, "weight_lbs") if not daily_df.empty else None
-    latest_bf = latest_metric(daily_df, "body_fat_pct") if not daily_df.empty else None
+    if active_goal:
+        st.success(
+            "Saved Goal: "
+            f"{active_goal.get('goal_name', 'Current Goal')} | "
+            f"Cals {float(active_goal.get('target_cals', 0)):.0f}, "
+            f"Protein {float(active_goal.get('target_protein', 0)):.1f}g, "
+            f"Carbs {float(active_goal.get('target_carbs', 0)):.1f}g, "
+            f"Fat {float(active_goal.get('target_fat', 0)):.1f}g"
+        )
+    else:
+        st.info("No macro goal saved yet. Use one of the save buttons below.")
+
+    latest_weight = latest_metric(daily_df, "weight_lbs")
+    latest_bf = latest_metric(daily_df, "body_fat_pct")
     default_weight = float(latest_weight) if latest_weight is not None else 189.0
     default_bf = float(latest_bf) if latest_bf is not None else 0.0
 
@@ -709,30 +786,10 @@ def render_macro_calculator(daily_df: pd.DataFrame) -> None:
         lm2.metric("Fat Mass", f"{fat_mass:.1f} lbs")
 
     st.markdown("### Weight Multiplier Tables")
-    needed_cals_df = pd.DataFrame(
-        {
-            "cals_per_lb": [14, 15, 16, 17],
-            "needed_cals": [body_weight * x for x in [14, 15, 16, 17]],
-        }
-    )
-    protein_df = pd.DataFrame(
-        {
-            "protein_ratio_g_per_lb": [1.0, 1.1, 1.25, 1.5],
-            "protein_grams": [body_weight * x for x in [1.0, 1.1, 1.25, 1.5]],
-        }
-    )
-    carb_df = pd.DataFrame(
-        {
-            "carb_ratio_g_per_lb": [0.75, 1.0, 1.25, 1.5],
-            "carb_grams": [body_weight * x for x in [0.75, 1.0, 1.25, 1.5]],
-        }
-    )
-    fat_df = pd.DataFrame(
-        {
-            "fat_ratio_g_per_lb": [0.30, 0.35, 0.40, 0.45, 0.50, 0.55, 0.60, 0.65, 0.70],
-            "fat_grams": [body_weight * x for x in [0.30, 0.35, 0.40, 0.45, 0.50, 0.55, 0.60, 0.65, 0.70]],
-        }
-    )
+    needed_cals_df = pd.DataFrame({"cals_per_lb": [14, 15, 16, 17], "needed_cals": [body_weight * x for x in [14, 15, 16, 17]]})
+    protein_df = pd.DataFrame({"protein_ratio_g_per_lb": [1.0, 1.1, 1.25, 1.5], "protein_grams": [body_weight * x for x in [1.0, 1.1, 1.25, 1.5]]})
+    carb_df = pd.DataFrame({"carb_ratio_g_per_lb": [0.75, 1.0, 1.25, 1.5], "carb_grams": [body_weight * x for x in [0.75, 1.0, 1.25, 1.5]]})
+    fat_df = pd.DataFrame({"fat_ratio_g_per_lb": [0.30, 0.35, 0.40, 0.45, 0.50, 0.55, 0.60, 0.65, 0.70], "fat_grams": [body_weight * x for x in [0.30, 0.35, 0.40, 0.45, 0.50, 0.55, 0.60, 0.65, 0.70]]})
 
     t1, t2 = st.columns(2)
     with t1:
@@ -759,6 +816,25 @@ def render_macro_calculator(daily_df: pd.DataFrame) -> None:
     out1, out2 = st.columns(2)
     with out1:
         st.markdown("#### Maintenance Results")
+        if st.button("Save Maintenance As Active Goal"):
+            try:
+                save_active_macro_goal(
+                    client,
+                    "Maintenance",
+                    maintenance_cals,
+                    maint["protein_g"],
+                    maint["carbs_g"],
+                    maint["fat_g"],
+                    body_weight,
+                    body_fat_pct,
+                    bmr,
+                    daily_activity,
+                )
+                st.success("Maintenance goal saved.")
+                st.rerun()
+            except Exception as exc:
+                st.error("Could not save goal. Add macro_goals table in Supabase SQL Editor first.")
+                st.code(str(exc))
         st.dataframe(
             pd.DataFrame(
                 [
@@ -777,6 +853,25 @@ def render_macro_calculator(daily_df: pd.DataFrame) -> None:
         )
     with out2:
         st.markdown("#### Deficit Results")
+        if st.button("Save Deficit As Active Goal"):
+            try:
+                save_active_macro_goal(
+                    client,
+                    "Deficit",
+                    deficit_cals,
+                    cut["protein_g"],
+                    cut["carbs_g"],
+                    cut["fat_g"],
+                    body_weight,
+                    body_fat_pct,
+                    bmr,
+                    daily_activity,
+                )
+                st.success("Deficit goal saved.")
+                st.rerun()
+            except Exception as exc:
+                st.error("Could not save goal. Add macro_goals table in Supabase SQL Editor first.")
+                st.code(str(exc))
         st.dataframe(
             pd.DataFrame(
                 [
@@ -798,7 +893,7 @@ def render_macro_calculator(daily_df: pd.DataFrame) -> None:
         st.warning("Protein and fat calories exceed total target calories in at least one plan. Increase calories or lower ratios.")
 
 
-def render_import() -> None:
+def render_import(client: Client) -> None:
     st.subheader("Import CSV (Body Metrics)")
     st.caption("Upload CSV with columns like: date, weight_lbs, body_fat_pct, steps, calories, food_notes")
 
@@ -813,7 +908,7 @@ def render_import() -> None:
     st.dataframe(cleaned.head(20), use_container_width=True)
 
     if st.button("Import Rows"):
-        count = import_rows(cleaned)
+        count = import_rows(client, cleaned)
         st.success(f"Imported/updated {count} row(s).")
 
 
@@ -847,14 +942,24 @@ def render_export(daily_df: pd.DataFrame, macro_df: pd.DataFrame) -> None:
 def main() -> None:
     st.set_page_config(page_title="Fitness Tracker", layout="wide")
     st.title("Personal Fitness Tracker")
-    st.caption("Log food by grams, keep running macro totals, and track body metrics.")
+    st.caption("Supabase-backed tracking for food, macros, and body metrics across devices.")
 
-    init_db()
-    seed_default_foods()
+    client = require_supabase()
+    if client is None:
+        st.stop()
 
-    foods_df = fetch_foods()
-    daily_df = fetch_daily_entries()
-    macro_df = fetch_daily_macro_totals()
+    try:
+        seed_default_foods(client)
+    except Exception as exc:
+        st.error("Supabase tables are not ready or credentials are invalid.")
+        st.code(str(exc))
+        st.info("Create tables in Supabase first, then refresh.")
+        st.stop()
+
+    foods_df = fetch_foods(client)
+    daily_df = fetch_daily_entries(client)
+    macro_df = fetch_daily_macro_totals(client)
+    active_goal = fetch_active_macro_goal(client)
 
     page = st.sidebar.radio(
         "Navigate",
@@ -862,17 +967,17 @@ def main() -> None:
     )
 
     if page == "Dashboard":
-        render_dashboard(daily_df, macro_df)
+        render_dashboard(daily_df, macro_df, active_goal)
     elif page == "Food Log":
-        render_food_log(foods_df)
+        render_food_log(client, foods_df, macro_df, active_goal)
     elif page == "Manage Foods":
-        render_manage_foods(foods_df)
+        render_manage_foods(client, foods_df)
     elif page == "Body Metrics":
-        render_add_entry()
+        render_add_entry(client)
     elif page == "Macro Calculator":
-        render_macro_calculator(daily_df)
+        render_macro_calculator(client, daily_df, active_goal)
     elif page == "Import CSV":
-        render_import()
+        render_import(client)
     elif page == "Export":
         render_export(daily_df, macro_df)
 
