@@ -251,7 +251,7 @@ def log_food_entry(client: Client, entry_date: date, food_id: int, grams: float,
 def fetch_food_logs(client: Client, entry_date: date) -> pd.DataFrame:
     logs = (
         client.table("food_logs")
-        .select("id, food_id, grams, servings, cals, protein, carbs, fat, notes")
+        .select("id, food_id, grams, servings, cals, protein, carbs, fat, notes, created_at")
         .eq("entry_date", entry_date.isoformat())
         .order("id", desc=True)
         .execute()
@@ -259,7 +259,7 @@ def fetch_food_logs(client: Client, entry_date: date) -> pd.DataFrame:
         or []
     )
     if not logs:
-        return pd.DataFrame(columns=["id", "name", "category", "grams", "servings", "cals", "protein", "carbs", "fat", "notes"])
+        return pd.DataFrame(columns=["id", "name", "category", "grams", "servings", "cals", "protein", "carbs", "fat", "notes", "created_at"])
 
     logs_df = pd.DataFrame(logs)
     food_ids = logs_df["food_id"].dropna().astype(int).unique().tolist()
@@ -275,7 +275,7 @@ def fetch_food_logs(client: Client, entry_date: date) -> pd.DataFrame:
     foods_df = pd.DataFrame(foods)
 
     merged = logs_df.merge(foods_df, left_on="food_id", right_on="id", how="left", suffixes=("", "_food"))
-    merged = merged[["id", "name", "category", "grams", "servings", "cals", "protein", "carbs", "fat", "notes"]]
+    merged = merged[["id", "name", "category", "grams", "servings", "cals", "protein", "carbs", "fat", "notes", "created_at"]]
     return merged
 
 
@@ -472,6 +472,53 @@ def totals_for_date(macro_df: pd.DataFrame, target_date: date) -> dict:
     }
 
 
+def fetch_last_meal(client: Client) -> dict | None:
+    rows = (
+        client.table("food_logs")
+        .select("id, food_id, created_at")
+        .order("created_at", desc=True)
+        .limit(1)
+        .execute()
+        .data
+        or []
+    )
+    if not rows:
+        return None
+
+    meal = rows[0]
+    food_id = meal.get("food_id")
+    food_name = "Meal"
+    if food_id is not None:
+        foods = (
+            client.table("foods")
+            .select("name")
+            .eq("id", food_id)
+            .limit(1)
+            .execute()
+            .data
+            or []
+        )
+        if foods:
+            food_name = foods[0].get("name", "Meal")
+
+    created_raw = meal.get("created_at")
+    created_at = pd.to_datetime(created_raw, utc=True, errors="coerce")
+    if pd.isna(created_at):
+        return None
+
+    now_utc = pd.Timestamp(datetime.now(timezone.utc))
+    delta = now_utc - created_at
+    total_seconds = max(int(delta.total_seconds()), 0)
+    hours = total_seconds // 3600
+    minutes = (total_seconds % 3600) // 60
+
+    return {
+        "food_name": food_name,
+        "created_at": created_at,
+        "elapsed_text": f"{hours}h {minutes}m",
+    }
+
+
 def render_goals_vs_actual(actual: dict, goals: dict, section_title: str) -> None:
     st.markdown(f"### {section_title}")
 
@@ -507,19 +554,26 @@ def render_goals_vs_actual(actual: dict, goals: dict, section_title: str) -> Non
                 st.progress(min(pct / 100.0, 1.0))
 
 
-def render_dashboard(daily_df: pd.DataFrame, macro_df: pd.DataFrame, active_goal: dict | None) -> None:
+def render_dashboard(client: Client, daily_df: pd.DataFrame, macro_df: pd.DataFrame, active_goal: dict | None) -> None:
     st.subheader("Dashboard")
 
-    c1, c2, c3, c4 = st.columns(4)
+    c1, c2, c3, c4, c5 = st.columns(5)
     lw = latest_metric(daily_df, "weight_lbs")
     lbf = latest_metric(daily_df, "body_fat_pct")
     ls = latest_metric(daily_df, "steps")
     lc = latest_metric(macro_df, "cals")
+    last_meal = fetch_last_meal(client)
 
     c1.metric("Latest Weight", "-" if lw is None else f"{lw:.1f} lbs")
     c2.metric("Latest Body Fat", "-" if lbf is None else f"{lbf:.1f}%")
     c3.metric("Latest Steps", "-" if ls is None else f"{int(ls):,}")
     c4.metric("Latest Food Cals", "-" if lc is None else f"{int(lc):,}")
+    if last_meal:
+        c5.metric("Time Since Last Meal", last_meal["elapsed_text"])
+        c5.caption(f"Last: {last_meal['food_name']}")
+    else:
+        c5.metric("Time Since Last Meal", "-")
+        c5.caption("No meals logged yet")
 
     compare_date = st.date_input("Goal Comparison Date", value=date.today(), key="dashboard_compare_date")
     if active_goal:
@@ -625,6 +679,9 @@ def render_food_log(client: Client, foods_df: pd.DataFrame, macro_df: pd.DataFra
     display = logs_df.copy()
     for col in ["grams", "servings", "cals", "protein", "carbs", "fat"]:
         display[col] = display[col].round(2)
+    if "created_at" in display.columns:
+        display["logged_at"] = pd.to_datetime(display["created_at"], errors="coerce", utc=True).dt.strftime("%Y-%m-%d %I:%M %p UTC")
+        display = display.drop(columns=["created_at"])
     st.dataframe(display, use_container_width=True)
 
     delete_options = {f"#{int(r.id)} - {r.name} ({r.servings:.2f} servings)": int(r.id) for _, r in logs_df.iterrows()}
@@ -967,7 +1024,7 @@ def main() -> None:
     )
 
     if page == "Dashboard":
-        render_dashboard(daily_df, macro_df, active_goal)
+        render_dashboard(client, daily_df, macro_df, active_goal)
     elif page == "Food Log":
         render_food_log(client, foods_df, macro_df, active_goal)
     elif page == "Manage Foods":
