@@ -108,3 +108,82 @@ This will copy:
 ## Goal Tracking
 
 Macro goals are now saved from `Macro Calculator` into `macro_goals` and used in `Dashboard` and `Food Log` for goal-vs-actual progress.
+
+## Auth + RLS Migration (Security)
+
+Run this in Supabase SQL Editor to enable per-user data isolation with Supabase Auth.
+
+```sql
+alter table daily_entries add column if not exists user_id uuid references auth.users(id) on delete cascade;
+alter table foods add column if not exists user_id uuid references auth.users(id) on delete cascade;
+alter table food_logs add column if not exists user_id uuid references auth.users(id) on delete cascade;
+alter table macro_goals add column if not exists user_id uuid references auth.users(id) on delete cascade;
+
+-- One-time legacy backfill for a single-user app.
+-- If you have multiple users already, set user_id per user instead of this blanket update.
+update daily_entries set user_id = (select id from auth.users order by created_at limit 1) where user_id is null;
+update foods set user_id = (select id from auth.users order by created_at limit 1) where user_id is null;
+update food_logs set user_id = (select id from auth.users order by created_at limit 1) where user_id is null;
+update macro_goals set user_id = (select id from auth.users order by created_at limit 1) where user_id is null;
+
+alter table foods drop constraint if exists foods_name_key;
+
+do $$
+begin
+  if not exists (
+    select 1 from pg_constraint where conname = 'foods_user_id_name_key'
+  ) then
+    alter table foods add constraint foods_user_id_name_key unique (user_id, name);
+  end if;
+end $$;
+
+alter table daily_entries drop constraint if exists daily_entries_pkey;
+
+do $$
+begin
+  if not exists (
+    select 1 from pg_constraint where conname = 'daily_entries_user_id_entry_date_key'
+  ) then
+    alter table daily_entries add constraint daily_entries_user_id_entry_date_key unique (user_id, entry_date);
+  end if;
+end $$;
+
+do $$
+begin
+  if not exists (
+    select 1 from pg_constraint where conname = 'macro_goals_user_id_key'
+  ) then
+    alter table macro_goals add constraint macro_goals_user_id_key unique (user_id);
+  end if;
+end $$;
+
+alter table daily_entries enable row level security;
+alter table foods enable row level security;
+alter table food_logs enable row level security;
+alter table macro_goals enable row level security;
+
+drop policy if exists daily_entries_isolation on daily_entries;
+create policy daily_entries_isolation on daily_entries
+for all using (auth.uid() = user_id)
+with check (auth.uid() = user_id);
+
+drop policy if exists foods_isolation on foods;
+create policy foods_isolation on foods
+for all using (auth.uid() = user_id)
+with check (auth.uid() = user_id);
+
+drop policy if exists food_logs_isolation on food_logs;
+create policy food_logs_isolation on food_logs
+for all using (auth.uid() = user_id)
+with check (auth.uid() = user_id);
+
+drop policy if exists macro_goals_isolation on macro_goals;
+create policy macro_goals_isolation on macro_goals
+for all using (auth.uid() = user_id)
+with check (auth.uid() = user_id);
+```
+
+After running the SQL:
+1. Reboot Streamlit Cloud app.
+2. Sign in / create account in the app.
+3. If your data was already in the tables, verify those rows now have user_id set after running the migration SQL.

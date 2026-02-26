@@ -58,7 +58,6 @@ DEFAULT_FOODS = [
 ]
 
 
-@st.cache_resource
 def get_supabase_client() -> Client:
     url = st.secrets.get("SUPABASE_URL") if "SUPABASE_URL" in st.secrets else os.getenv("SUPABASE_URL")
     key = st.secrets.get("SUPABASE_ANON_KEY") if "SUPABASE_ANON_KEY" in st.secrets else os.getenv("SUPABASE_ANON_KEY")
@@ -79,6 +78,68 @@ def require_supabase() -> Client | None:
         return None
 
 
+def get_authenticated_user(client: Client) -> dict | None:
+    if st.session_state.get("auth_user"):
+        return st.session_state["auth_user"]
+
+    st.subheader("Sign In")
+    tab1, tab2 = st.tabs(["Login", "Create Account"])
+
+    with tab1:
+        with st.form("login_form"):
+            email = st.text_input("Email", key="login_email")
+            password = st.text_input("Password", type="password", key="login_password")
+            submitted = st.form_submit_button("Login")
+
+        if submitted:
+            try:
+                resp = client.auth.sign_in_with_password({"email": email.strip(), "password": password})
+                if resp.user:
+                    st.session_state["auth_user"] = {"id": resp.user.id, "email": resp.user.email}
+                    st.rerun()
+                st.error("Login failed.")
+            except Exception as exc:
+                st.error(f"Login failed: {exc}")
+
+    with tab2:
+        with st.form("signup_form"):
+            email_new = st.text_input("Email", key="signup_email")
+            password_new = st.text_input("Password", type="password", key="signup_password")
+            submitted_new = st.form_submit_button("Create Account")
+
+        if submitted_new:
+            try:
+                resp = client.auth.sign_up({"email": email_new.strip(), "password": password_new})
+                if resp.user:
+                    st.success("Account created. Please log in.")
+                else:
+                    st.success("Check your email to confirm account, then log in.")
+            except Exception as exc:
+                st.error(f"Signup failed: {exc}")
+
+    return None
+
+
+def render_auth_sidebar(client: Client, user: dict) -> None:
+    st.sidebar.caption(f"Signed in as: {user.get('email', 'Unknown')}")
+    if st.sidebar.button("Sign Out"):
+        try:
+            client.auth.sign_out()
+        except Exception:
+            pass
+        st.session_state.pop("auth_user", None)
+        st.rerun()
+
+
+def backfill_legacy_user_id(client: Client, user_id: str) -> None:
+    # One-time compatibility step for legacy rows created before user_id existed.
+    for table in ["daily_entries", "foods", "food_logs", "macro_goals"]:
+        try:
+            client.table(table).update({"user_id": user_id}).is_("user_id", "null").execute()
+        except Exception:
+            pass
+
+
 def default_food_input_config(food_name: str) -> tuple[str, str, float]:
     name = food_name.strip().lower()
     if name == "eggs":
@@ -94,12 +155,13 @@ def default_food_input_config(food_name: str) -> tuple[str, str, float]:
     return ("grams", "serving", 1.0)
 
 
-def seed_default_foods(client: Client) -> None:
+def seed_default_foods(client: Client, user_id: str) -> None:
     rows = []
     for food in DEFAULT_FOODS:
         mode, unit_label, units_per_serving = default_food_input_config(food["name"])
         rows.append(
             {
+                "user_id": user_id,
                 "name": food["name"],
                 "category": food["category"],
                 "grams_per_serving": food["grams_per_serving"],
@@ -113,7 +175,7 @@ def seed_default_foods(client: Client) -> None:
             }
         )
 
-    client.table("foods").upsert(rows, on_conflict="name").execute()
+    client.table("foods").upsert(rows, on_conflict="user_id,name").execute()
 
 
 def normalize_import_columns(df: pd.DataFrame) -> pd.DataFrame:
@@ -151,6 +213,7 @@ def normalize_import_columns(df: pd.DataFrame) -> pd.DataFrame:
 
 def upsert_daily_entry(
     client: Client,
+    user_id: str,
     entry_date: date,
     weight_lbs: float | None,
     body_fat_pct: float | None,
@@ -159,6 +222,7 @@ def upsert_daily_entry(
     food_notes: str,
 ) -> None:
     payload = {
+        "user_id": user_id,
         "entry_date": entry_date.isoformat(),
         "weight_lbs": weight_lbs,
         "body_fat_pct": body_fat_pct,
@@ -167,13 +231,14 @@ def upsert_daily_entry(
         "food_notes": food_notes,
         "updated_at": datetime.now(timezone.utc).isoformat(),
     }
-    client.table("daily_entries").upsert(payload, on_conflict="entry_date").execute()
+    client.table("daily_entries").upsert(payload, on_conflict="user_id,entry_date").execute()
 
 
-def fetch_daily_entries(client: Client) -> pd.DataFrame:
+def fetch_daily_entries(client: Client, user_id: str) -> pd.DataFrame:
     data = (
         client.table("daily_entries")
         .select("entry_date, weight_lbs, body_fat_pct, steps, calories, food_notes")
+        .eq("user_id", user_id)
         .order("entry_date")
         .execute()
         .data
@@ -187,13 +252,14 @@ def fetch_daily_entries(client: Client) -> pd.DataFrame:
     return df
 
 
-def fetch_foods(client: Client) -> pd.DataFrame:
+def fetch_foods(client: Client, user_id: str) -> pd.DataFrame:
     data = (
         client.table("foods")
         .select(
             "id, name, category, grams_per_serving, cals_per_serving, protein_per_serving, "
             "carbs_per_serving, fat_per_serving, input_mode, unit_label, units_per_serving"
         )
+        .eq("user_id", user_id)
         .order("category")
         .order("name")
         .execute()
@@ -219,11 +285,12 @@ def fetch_foods(client: Client) -> pd.DataFrame:
     return pd.DataFrame(data)
 
 
-def log_food_entry(client: Client, entry_date: date, food_id: int, grams: float, notes: str) -> None:
+def log_food_entry(client: Client, user_id: str, entry_date: date, food_id: int, grams: float, notes: str) -> None:
     rows = (
         client.table("foods")
         .select("grams_per_serving, cals_per_serving, protein_per_serving, carbs_per_serving, fat_per_serving")
         .eq("id", food_id)
+        .eq("user_id", user_id)
         .limit(1)
         .execute()
         .data
@@ -237,6 +304,7 @@ def log_food_entry(client: Client, entry_date: date, food_id: int, grams: float,
     servings = grams / grams_per_serving if grams_per_serving > 0 else 0
 
     payload = {
+        "user_id": user_id,
         "entry_date": entry_date.isoformat(),
         "food_id": int(food_id),
         "grams": float(grams),
@@ -251,11 +319,12 @@ def log_food_entry(client: Client, entry_date: date, food_id: int, grams: float,
     client.table("food_logs").insert(payload).execute()
 
 
-def fetch_food_logs(client: Client, entry_date: date) -> pd.DataFrame:
+def fetch_food_logs(client: Client, user_id: str, entry_date: date) -> pd.DataFrame:
     logs = (
         client.table("food_logs")
         .select("id, food_id, grams, servings, cals, protein, carbs, fat, notes, created_at")
         .eq("entry_date", entry_date.isoformat())
+        .eq("user_id", user_id)
         .order("id", desc=True)
         .execute()
         .data
@@ -270,6 +339,7 @@ def fetch_food_logs(client: Client, entry_date: date) -> pd.DataFrame:
     foods = (
         client.table("foods")
         .select("id, name, category")
+        .eq("user_id", user_id)
         .in_("id", food_ids)
         .execute()
         .data
@@ -282,14 +352,15 @@ def fetch_food_logs(client: Client, entry_date: date) -> pd.DataFrame:
     return merged
 
 
-def delete_food_log(client: Client, log_id: int) -> None:
-    client.table("food_logs").delete().eq("id", log_id).execute()
+def delete_food_log(client: Client, user_id: str, log_id: int) -> None:
+    client.table("food_logs").delete().eq("id", log_id).eq("user_id", user_id).execute()
 
 
-def fetch_daily_macro_totals(client: Client) -> pd.DataFrame:
+def fetch_daily_macro_totals(client: Client, user_id: str) -> pd.DataFrame:
     logs = (
         client.table("food_logs")
         .select("entry_date, cals, protein, carbs, fat")
+        .eq("user_id", user_id)
         .order("entry_date")
         .execute()
         .data
@@ -314,6 +385,7 @@ def fetch_daily_macro_totals(client: Client) -> pd.DataFrame:
 
 def add_food(
     client: Client,
+    user_id: str,
     name: str,
     category: str,
     grams_per_serving: float,
@@ -327,6 +399,7 @@ def add_food(
 ) -> None:
     client.table("foods").insert(
         {
+            "user_id": user_id,
             "name": name.strip(),
             "category": category,
             "grams_per_serving": grams_per_serving,
@@ -341,11 +414,12 @@ def add_food(
     ).execute()
 
 
-def import_rows(client: Client, df: pd.DataFrame) -> int:
+def import_rows(client: Client, user_id: str, df: pd.DataFrame) -> int:
     rows = []
     for _, row in df.iterrows():
         rows.append(
             {
+                "user_id": user_id,
                 "entry_date": row["date"].isoformat(),
                 "weight_lbs": None if pd.isna(row["weight_lbs"]) else float(row["weight_lbs"]),
                 "body_fat_pct": None if pd.isna(row["body_fat_pct"]) else float(row["body_fat_pct"]),
@@ -357,7 +431,7 @@ def import_rows(client: Client, df: pd.DataFrame) -> int:
         )
 
     if rows:
-        client.table("daily_entries").upsert(rows, on_conflict="entry_date").execute()
+        client.table("daily_entries").upsert(rows, on_conflict="user_id,entry_date").execute()
     return len(rows)
 
 
@@ -410,15 +484,15 @@ def macro_breakdown(total_cals: float, body_weight: float, protein_ratio: float,
     }
 
 
-def fetch_active_macro_goal(client: Client) -> dict | None:
+def fetch_active_macro_goal(client: Client, user_id: str) -> dict | None:
     try:
         rows = (
             client.table("macro_goals")
             .select(
-                "id, goal_name, target_cals, target_protein, target_carbs, target_fat, "
+                "goal_name, target_cals, target_protein, target_carbs, target_fat, "
                 "body_weight, body_fat_pct, bmr, daily_activity, updated_at"
             )
-            .eq("id", 1)
+            .eq("user_id", user_id)
             .limit(1)
             .execute()
             .data
@@ -432,6 +506,7 @@ def fetch_active_macro_goal(client: Client) -> dict | None:
 
 def save_active_macro_goal(
     client: Client,
+    user_id: str,
     goal_name: str,
     target_cals: float,
     target_protein: float,
@@ -443,7 +518,7 @@ def save_active_macro_goal(
     daily_activity: float,
 ) -> None:
     payload = {
-        "id": 1,
+        "user_id": user_id,
         "goal_name": goal_name,
         "target_cals": target_cals,
         "target_protein": target_protein,
@@ -455,7 +530,7 @@ def save_active_macro_goal(
         "daily_activity": daily_activity,
         "updated_at": datetime.now(timezone.utc).isoformat(),
     }
-    client.table("macro_goals").upsert(payload, on_conflict="id").execute()
+    client.table("macro_goals").upsert(payload, on_conflict="user_id").execute()
 
 
 def totals_for_date(macro_df: pd.DataFrame, target_date: date) -> dict:
@@ -475,10 +550,11 @@ def totals_for_date(macro_df: pd.DataFrame, target_date: date) -> dict:
     }
 
 
-def fetch_last_meal(client: Client) -> dict | None:
+def fetch_last_meal(client: Client, user_id: str) -> dict | None:
     rows = (
         client.table("food_logs")
         .select("id, food_id, created_at")
+        .eq("user_id", user_id)
         .order("created_at", desc=True)
         .limit(1)
         .execute()
@@ -496,6 +572,7 @@ def fetch_last_meal(client: Client) -> dict | None:
             client.table("foods")
             .select("name")
             .eq("id", food_id)
+            .eq("user_id", user_id)
             .limit(1)
             .execute()
             .data
@@ -560,7 +637,7 @@ def render_goals_vs_actual(actual: dict, goals: dict, section_title: str) -> Non
                 st.progress(min(pct / 100.0, 1.0))
 
 
-def render_dashboard(client: Client, daily_df: pd.DataFrame, macro_df: pd.DataFrame, active_goal: dict | None) -> None:
+def render_dashboard(client: Client, user_id: str, daily_df: pd.DataFrame, macro_df: pd.DataFrame, active_goal: dict | None) -> None:
     st.subheader("Dashboard")
 
     c1, c2, c3, c4, c5 = st.columns(5)
@@ -568,7 +645,7 @@ def render_dashboard(client: Client, daily_df: pd.DataFrame, macro_df: pd.DataFr
     lbf = latest_metric(daily_df, "body_fat_pct")
     ls = latest_metric(daily_df, "steps")
     lc = latest_metric(macro_df, "cals")
-    last_meal = fetch_last_meal(client)
+    last_meal = fetch_last_meal(client, user_id)
 
     c1.metric("Latest Weight", "-" if lw is None else f"{lw:.1f} lbs")
     c2.metric("Latest Body Fat", "-" if lbf is None else f"{lbf:.1f}%")
@@ -605,7 +682,7 @@ def render_dashboard(client: Client, daily_df: pd.DataFrame, macro_df: pd.DataFr
         st.info("No data yet. Start in Food Log and Body Metrics.")
 
 
-def render_food_log(client: Client, foods_df: pd.DataFrame, macro_df: pd.DataFrame, active_goal: dict | None) -> None:
+def render_food_log(client: Client, user_id: str, foods_df: pd.DataFrame, macro_df: pd.DataFrame, active_goal: dict | None) -> None:
     st.subheader("Food Log")
     log_date = st.date_input("Date", value=date.today(), key="food_log_date")
 
@@ -647,11 +724,11 @@ def render_food_log(client: Client, foods_df: pd.DataFrame, macro_df: pd.DataFra
                 servings = float(amount) / units_per_serving
                 grams_to_log = servings * float(selected_food["grams_per_serving"])
 
-            log_food_entry(client, log_date, food_id, grams_to_log, notes)
+            log_food_entry(client, user_id, log_date, food_id, grams_to_log, notes)
             st.success("Food entry added.")
             st.rerun()
 
-    logs_df = fetch_food_logs(client, log_date)
+    logs_df = fetch_food_logs(client, user_id, log_date)
 
     st.markdown("### Running Totals")
     if logs_df.empty:
@@ -693,12 +770,12 @@ def render_food_log(client: Client, foods_df: pd.DataFrame, macro_df: pd.DataFra
     delete_options = {f"#{int(r.id)} - {r.name} ({r.servings:.2f} servings)": int(r.id) for _, r in logs_df.iterrows()}
     selected_delete = st.selectbox("Delete an entry", options=["None"] + list(delete_options.keys()))
     if selected_delete != "None" and st.button("Delete Selected Entry"):
-        delete_food_log(client, delete_options[selected_delete])
+        delete_food_log(client, user_id, delete_options[selected_delete])
         st.success("Entry deleted.")
         st.rerun()
 
 
-def render_manage_foods(client: Client, foods_df: pd.DataFrame) -> None:
+def render_manage_foods(client: Client, user_id: str, foods_df: pd.DataFrame) -> None:
     st.subheader("Manage Foods")
     st.caption("Add custom foods with macros per serving. These become selectable in Food Log.")
 
@@ -734,7 +811,7 @@ def render_manage_foods(client: Client, foods_df: pd.DataFrame) -> None:
             st.error("Food name is required.")
         else:
             try:
-                add_food(client, name, category, grams_per_serving, cals, pro, carbs, fat, input_mode, unit_label, units_per_serving)
+                add_food(client, user_id, name, category, grams_per_serving, cals, pro, carbs, fat, input_mode, unit_label, units_per_serving)
                 st.success(f"Added '{name}'.")
                 st.rerun()
             except Exception as exc:
@@ -761,7 +838,7 @@ def render_manage_foods(client: Client, foods_df: pd.DataFrame) -> None:
     st.dataframe(display, use_container_width=True)
 
 
-def render_add_entry(client: Client) -> None:
+def render_add_entry(client: Client, user_id: str) -> None:
     st.subheader("Body Metrics")
     st.caption("One row per day. Saving a date again updates that day.")
 
@@ -797,11 +874,11 @@ def render_add_entry(client: Client) -> None:
             st.error(f"Please correct invalid fields: {', '.join(invalid)}")
             return
 
-        upsert_daily_entry(client, entry_date, weight_lbs, body_fat_pct, steps, calories, food_notes)
+        upsert_daily_entry(client, user_id, entry_date, weight_lbs, body_fat_pct, steps, calories, food_notes)
         st.success(f"Saved body metrics for {entry_date.isoformat()}.")
 
 
-def render_macro_calculator(client: Client, daily_df: pd.DataFrame, active_goal: dict | None) -> None:
+def render_macro_calculator(client: Client, user_id: str, daily_df: pd.DataFrame, active_goal: dict | None) -> None:
     st.subheader("Macro Calculator")
     st.caption("Weight-based calorie and macro targets for maintenance and deficit.")
 
@@ -883,6 +960,7 @@ def render_macro_calculator(client: Client, daily_df: pd.DataFrame, active_goal:
             try:
                 save_active_macro_goal(
                     client,
+                    user_id,
                     "Maintenance",
                     maintenance_cals,
                     maint["protein_g"],
@@ -920,6 +998,7 @@ def render_macro_calculator(client: Client, daily_df: pd.DataFrame, active_goal:
             try:
                 save_active_macro_goal(
                     client,
+                    user_id,
                     "Deficit",
                     deficit_cals,
                     cut["protein_g"],
@@ -956,7 +1035,7 @@ def render_macro_calculator(client: Client, daily_df: pd.DataFrame, active_goal:
         st.warning("Protein and fat calories exceed total target calories in at least one plan. Increase calories or lower ratios.")
 
 
-def render_import(client: Client) -> None:
+def render_import(client: Client, user_id: str) -> None:
     st.subheader("Import CSV (Body Metrics)")
     st.caption("Upload CSV with columns like: date, weight_lbs, body_fat_pct, steps, calories, food_notes")
 
@@ -971,7 +1050,7 @@ def render_import(client: Client) -> None:
     st.dataframe(cleaned.head(20), use_container_width=True)
 
     if st.button("Import Rows"):
-        count = import_rows(client, cleaned)
+        count = import_rows(client, user_id, cleaned)
         st.success(f"Imported/updated {count} row(s).")
 
 
@@ -1011,18 +1090,27 @@ def main() -> None:
     if client is None:
         st.stop()
 
+    user = get_authenticated_user(client)
+    if user is None:
+        st.stop()
+
+    render_auth_sidebar(client, user)
+    user_id = user["id"]
+
+    backfill_legacy_user_id(client, user_id)
+
     try:
-        seed_default_foods(client)
+        seed_default_foods(client, user_id)
     except Exception as exc:
         st.error("Supabase tables are not ready or credentials are invalid.")
         st.code(str(exc))
-        st.info("Create tables in Supabase first, then refresh.")
+        st.info("Run the auth/RLS SQL migration in README, then refresh.")
         st.stop()
 
-    foods_df = fetch_foods(client)
-    daily_df = fetch_daily_entries(client)
-    macro_df = fetch_daily_macro_totals(client)
-    active_goal = fetch_active_macro_goal(client)
+    foods_df = fetch_foods(client, user_id)
+    daily_df = fetch_daily_entries(client, user_id)
+    macro_df = fetch_daily_macro_totals(client, user_id)
+    active_goal = fetch_active_macro_goal(client, user_id)
 
     page = st.sidebar.radio(
         "Navigate",
@@ -1030,17 +1118,17 @@ def main() -> None:
     )
 
     if page == "Dashboard":
-        render_dashboard(client, daily_df, macro_df, active_goal)
+        render_dashboard(client, user_id, daily_df, macro_df, active_goal)
     elif page == "Food Log":
-        render_food_log(client, foods_df, macro_df, active_goal)
+        render_food_log(client, user_id, foods_df, macro_df, active_goal)
     elif page == "Manage Foods":
-        render_manage_foods(client, foods_df)
+        render_manage_foods(client, user_id, foods_df)
     elif page == "Body Metrics":
-        render_add_entry(client)
+        render_add_entry(client, user_id)
     elif page == "Macro Calculator":
-        render_macro_calculator(client, daily_df, active_goal)
+        render_macro_calculator(client, user_id, daily_df, active_goal)
     elif page == "Import CSV":
-        render_import(client)
+        render_import(client, user_id)
     elif page == "Export":
         render_export(daily_df, macro_df)
 
