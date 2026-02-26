@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import os
 from datetime import date, datetime, timezone
+from zoneinfo import ZoneInfo
 
 import pandas as pd
 import plotly.express as px
@@ -16,6 +17,8 @@ ALIASES = {
     "calories": ["calories", "kcal", "cals", "total_calories", "total calories"],
     "food_notes": ["food_notes", "food", "notes", "food note", "meal_notes", "meals"],
 }
+
+LOCAL_TZ = ZoneInfo("America/Denver")
 
 DEFAULT_FOODS = [
     {"name": "Eggs", "category": "Protein", "grams_per_serving": 50, "cals": 70, "protein": 6, "carbs": 1, "fat": 5},
@@ -512,9 +515,12 @@ def fetch_last_meal(client: Client) -> dict | None:
     hours = total_seconds // 3600
     minutes = (total_seconds % 3600) // 60
 
+    created_local = created_at.tz_convert(LOCAL_TZ)
+
     return {
         "food_name": food_name,
-        "created_at": created_at,
+        "created_at": created_local,
+        "logged_at_local": created_local.strftime("%Y-%m-%d %I:%M %p %Z"),
         "elapsed_text": f"{hours}h {minutes}m",
     }
 
@@ -570,7 +576,7 @@ def render_dashboard(client: Client, daily_df: pd.DataFrame, macro_df: pd.DataFr
     c4.metric("Latest Food Cals", "-" if lc is None else f"{int(lc):,}")
     if last_meal:
         c5.metric("Time Since Last Meal", last_meal["elapsed_text"])
-        c5.caption(f"Last: {last_meal['food_name']}")
+        c5.caption(f"Last: {last_meal['food_name']} at {last_meal['logged_at_local']}")
     else:
         c5.metric("Time Since Last Meal", "-")
         c5.caption("No meals logged yet")
@@ -680,7 +686,7 @@ def render_food_log(client: Client, foods_df: pd.DataFrame, macro_df: pd.DataFra
     for col in ["grams", "servings", "cals", "protein", "carbs", "fat"]:
         display[col] = display[col].round(2)
     if "created_at" in display.columns:
-        display["logged_at"] = pd.to_datetime(display["created_at"], errors="coerce", utc=True).dt.strftime("%Y-%m-%d %I:%M %p UTC")
+        display["logged_at"] = pd.to_datetime(display["created_at"], errors="coerce", utc=True).dt.tz_convert(LOCAL_TZ).dt.strftime("%Y-%m-%d %I:%M %p %Z")
         display = display.drop(columns=["created_at"])
     st.dataframe(display, use_container_width=True)
 
