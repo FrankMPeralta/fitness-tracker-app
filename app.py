@@ -79,6 +79,18 @@ def require_supabase() -> Client | None:
 
 
 def get_authenticated_user(client: Client) -> dict | None:
+    if st.session_state.get("auth_session"):
+        try:
+            sess = st.session_state["auth_session"]
+            client.auth.set_session(sess["access_token"], sess["refresh_token"])
+            user = client.auth.get_user().user
+            if user:
+                st.session_state["auth_user"] = {"id": user.id, "email": user.email}
+                return st.session_state["auth_user"]
+        except Exception:
+            st.session_state.pop("auth_session", None)
+            st.session_state.pop("auth_user", None)
+
     if st.session_state.get("auth_user"):
         return st.session_state["auth_user"]
 
@@ -94,8 +106,12 @@ def get_authenticated_user(client: Client) -> dict | None:
         if submitted:
             try:
                 resp = client.auth.sign_in_with_password({"email": email.strip(), "password": password})
-                if resp.user:
+                if resp.user and resp.session:
                     st.session_state["auth_user"] = {"id": resp.user.id, "email": resp.user.email}
+                    st.session_state["auth_session"] = {
+                        "access_token": resp.session.access_token,
+                        "refresh_token": resp.session.refresh_token,
+                    }
                     st.rerun()
                 st.error("Login failed.")
             except Exception as exc:
@@ -128,6 +144,7 @@ def render_auth_sidebar(client: Client, user: dict) -> None:
         except Exception:
             pass
         st.session_state.pop("auth_user", None)
+        st.session_state.pop("auth_session", None)
         st.rerun()
 
 
