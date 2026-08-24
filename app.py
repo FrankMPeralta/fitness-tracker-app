@@ -89,7 +89,6 @@ def today_local() -> date:
     return datetime.now(LOCAL_TZ).date()
 
 
-@st.cache_resource
 def get_cookie_manager():
     if stx is None:
         return None
