@@ -1,12 +1,17 @@
 from __future__ import annotations
 
+import json
 import os
-from datetime import date, datetime, timezone
+from datetime import date, datetime, timedelta, timezone
 from zoneinfo import ZoneInfo
 
 import pandas as pd
 import plotly.express as px
 import streamlit as st
+try:
+    import extra_streamlit_components as stx
+except ImportError:
+    stx = None
 from supabase import Client, create_client
 
 ALIASES = {
@@ -19,6 +24,8 @@ ALIASES = {
 }
 
 LOCAL_TZ = ZoneInfo("America/Denver")
+AUTH_COOKIE_NAME = "fitness_tracker_auth_session"
+AUTH_COOKIE_DAYS = 7
 
 DEFAULT_FOODS = [
     {"name": "Eggs", "category": "Protein", "grams_per_serving": 50, "cals": 70, "protein": 6, "carbs": 1, "fat": 5},
@@ -78,18 +85,78 @@ def require_supabase() -> Client | None:
         return None
 
 
+def today_local() -> date:
+    return datetime.now(LOCAL_TZ).date()
+
+
+@st.cache_resource
+def get_cookie_manager():
+    if stx is None:
+        return None
+    return stx.CookieManager()
+
+
+def save_auth_cookie(cookie_manager, session: dict) -> None:
+    if cookie_manager is None:
+        return
+    cookie_manager.set(
+        AUTH_COOKIE_NAME,
+        json.dumps(session),
+        expires_at=datetime.now() + timedelta(days=AUTH_COOKIE_DAYS),
+    )
+
+
+def load_auth_cookie(cookie_manager) -> dict | None:
+    if cookie_manager is None:
+        return None
+    raw = cookie_manager.get(AUTH_COOKIE_NAME)
+    if not raw:
+        return None
+
+    try:
+        session = json.loads(raw)
+    except (TypeError, json.JSONDecodeError):
+        cookie_manager.delete(AUTH_COOKIE_NAME)
+        return None
+
+    if not session.get("access_token") or not session.get("refresh_token"):
+        cookie_manager.delete(AUTH_COOKIE_NAME)
+        return None
+
+    return session
+
+
+def clear_auth_state(cookie_manager=None) -> None:
+    st.session_state.pop("auth_session", None)
+    st.session_state.pop("auth_user", None)
+    if cookie_manager is not None:
+        cookie_manager.delete(AUTH_COOKIE_NAME)
+
+
 def get_authenticated_user(client: Client) -> dict | None:
+    cookie_manager = get_cookie_manager()
+    cookie_session = load_auth_cookie(cookie_manager)
+    if cookie_session and not st.session_state.get("auth_session"):
+        st.session_state["auth_session"] = cookie_session
+
     if st.session_state.get("auth_session"):
         try:
             sess = st.session_state["auth_session"]
             client.auth.set_session(sess["access_token"], sess["refresh_token"])
             user = client.auth.get_user().user
+            active_session = client.auth.get_session()
             if user:
                 st.session_state["auth_user"] = {"id": user.id, "email": user.email}
+                if active_session:
+                    refreshed = {
+                        "access_token": active_session.access_token,
+                        "refresh_token": active_session.refresh_token,
+                    }
+                    st.session_state["auth_session"] = refreshed
+                    save_auth_cookie(cookie_manager, refreshed)
                 return st.session_state["auth_user"]
         except Exception:
-            st.session_state.pop("auth_session", None)
-            st.session_state.pop("auth_user", None)
+            clear_auth_state(cookie_manager)
 
     if st.session_state.get("auth_user"):
         return st.session_state["auth_user"]
@@ -108,10 +175,12 @@ def get_authenticated_user(client: Client) -> dict | None:
                 resp = client.auth.sign_in_with_password({"email": email.strip(), "password": password})
                 if resp.user and resp.session:
                     st.session_state["auth_user"] = {"id": resp.user.id, "email": resp.user.email}
-                    st.session_state["auth_session"] = {
+                    session = {
                         "access_token": resp.session.access_token,
                         "refresh_token": resp.session.refresh_token,
                     }
+                    st.session_state["auth_session"] = session
+                    save_auth_cookie(cookie_manager, session)
                     st.rerun()
                 st.error("Login failed.")
             except Exception as exc:
@@ -138,13 +207,16 @@ def get_authenticated_user(client: Client) -> dict | None:
 
 def render_auth_sidebar(client: Client, user: dict) -> None:
     st.sidebar.caption(f"Signed in as: {user.get('email', 'Unknown')}")
+    if stx is None:
+        st.sidebar.caption("Login remembered until this app session ends. Run from the project .venv to remember for 7 days.")
+    else:
+        st.sidebar.caption(f"Login remembered for {AUTH_COOKIE_DAYS} days on this browser.")
     if st.sidebar.button("Sign Out"):
         try:
             client.auth.sign_out()
         except Exception:
             pass
-        st.session_state.pop("auth_user", None)
-        st.session_state.pop("auth_session", None)
+        clear_auth_state(get_cookie_manager())
         st.rerun()
 
 
@@ -675,7 +747,7 @@ def render_dashboard(client: Client, user_id: str, daily_df: pd.DataFrame, macro
         c5.metric("Time Since Last Meal", "-")
         c5.caption("No meals logged yet")
 
-    compare_date = st.date_input("Goal Comparison Date", value=date.today(), key="dashboard_compare_date")
+    compare_date = st.date_input("Goal Comparison Date", value=today_local(), key="dashboard_compare_date")
     if active_goal:
         actual = totals_for_date(macro_df, compare_date)
         goal_name = active_goal.get("goal_name", "Current Goal")
@@ -701,7 +773,7 @@ def render_dashboard(client: Client, user_id: str, daily_df: pd.DataFrame, macro
 
 def render_food_log(client: Client, user_id: str, foods_df: pd.DataFrame, macro_df: pd.DataFrame, active_goal: dict | None) -> None:
     st.subheader("Food Log")
-    log_date = st.date_input("Date", value=date.today(), key="food_log_date")
+    log_date = st.date_input("Date", value=today_local(), key="food_log_date")
 
     if foods_df.empty:
         st.warning("No foods available. Add foods in Manage Foods first.")
@@ -860,7 +932,7 @@ def render_add_entry(client: Client, user_id: str) -> None:
     st.caption("One row per day. Saving a date again updates that day.")
 
     with st.form("entry_form"):
-        entry_date = st.date_input("Date", value=date.today(), key="body_date")
+        entry_date = st.date_input("Date", value=today_local(), key="body_date")
         weight_raw = st.text_input("Weight (lbs)", placeholder="e.g., 188.4")
         body_fat_raw = st.text_input("Body Fat (%)", placeholder="e.g., 17.9")
         steps_raw = st.text_input("Steps", placeholder="e.g., 10421")
