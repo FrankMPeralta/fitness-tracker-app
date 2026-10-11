@@ -114,12 +114,16 @@ def load_auth_cookie(cookie_manager) -> dict | None:
         return None
 
     try:
-        session = json.loads(raw)
+        # The browser cookie library can decode JSON before returning it.
+        session = raw if isinstance(raw, dict) else json.loads(raw)
     except (TypeError, json.JSONDecodeError):
         cookie_manager.delete(AUTH_COOKIE_NAME)
         return None
 
-    if not session.get("access_token") or not session.get("refresh_token"):
+    if not isinstance(session, dict) or not all(
+        isinstance(session.get(key), str) and session[key]
+        for key in ("access_token", "refresh_token")
+    ):
         cookie_manager.delete(AUTH_COOKIE_NAME)
         return None
 
@@ -135,6 +139,7 @@ def clear_auth_state(cookie_manager=None) -> None:
 
 def get_authenticated_user(client: Client) -> dict | None:
     cookie_manager = get_cookie_manager()
+    st.session_state["auth_cookie_manager"] = cookie_manager
     cookie_session = load_auth_cookie(cookie_manager)
     if cookie_session and not st.session_state.get("auth_session"):
         st.session_state["auth_session"] = cookie_session
@@ -216,7 +221,7 @@ def render_auth_sidebar(client: Client, user: dict) -> None:
             client.auth.sign_out()
         except Exception:
             pass
-        clear_auth_state(get_cookie_manager())
+        clear_auth_state(st.session_state.get("auth_cookie_manager"))
         st.rerun()
 
 
