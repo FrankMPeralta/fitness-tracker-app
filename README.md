@@ -101,8 +101,13 @@ This will copy:
 - `Body Metrics`: weight, body-fat, steps.
 - `Macro Calculator`: maintenance/deficit planning.
 - `Dashboard`: trends and daily macro totals.
+- `Workouts`: templates, weekly schedule, set logging, exercise library and history.
 - `Import CSV`: import body metrics.
 - `Export`: export body metrics + daily macro totals.
+
+For workout activation, table relationships, and the incremental implementation
+plan, see [WORKOUTS.md](WORKOUTS.md). Run `migrations/001_workouts.sql` in Supabase
+before using the Workouts page. Deploy `workouts.py` alongside `app.py`.
 
 
 ## Goal Tracking

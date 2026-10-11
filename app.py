@@ -13,6 +13,7 @@ try:
 except ImportError:
     stx = None
 from supabase import Client, create_client
+from workouts import render_workouts
 
 ALIASES = {
     "date": ["date", "day"],
@@ -1202,11 +1203,13 @@ def main() -> None:
 
     page = st.sidebar.radio(
         "Navigate",
-        ["Dashboard", "Food Log", "Manage Foods", "Body Metrics", "Macro Calculator", "Import CSV", "Export"],
+        ["Dashboard", "Workouts", "Food Log", "Manage Foods", "Body Metrics", "Macro Calculator", "Import CSV", "Export"],
     )
 
     if page == "Dashboard":
         render_dashboard(client, user_id, daily_df, macro_df, active_goal)
+    elif page == "Workouts":
+        render_workouts(client, user_id, today_local())
     elif page == "Food Log":
         render_food_log(client, user_id, foods_df, macro_df, active_goal)
     elif page == "Manage Foods":
