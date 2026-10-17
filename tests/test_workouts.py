@@ -44,6 +44,8 @@ class WorkoutTests(unittest.TestCase):
         self.assertEqual(seen[0]['user_id'], 'eq.user-a')
         self.assertEqual(seen[0]['completed'], 'eq.True')
         self.assertEqual(seen[0]['session_id'], 'neq.current')
+        self.assertEqual(seen[0]['workout_sessions.status'], 'eq.completed')
+        self.assertIn('knee_discomfort', seen[0]['select'])
         self.assertEqual(seen[0]['order'], 'workout_sessions(performed_date).desc')
 
     def test_missing_migration_is_reported_without_crashing(self):

@@ -15,6 +15,8 @@ The first increment implements:
 - Workout logging with blank starting weights, optional RIR, per-set notes and
   completion, substitutions, workout recovery notes, and knee discomfort.
 - Previous completed exercise performance and editable workout history.
+- Suggested starting weights from the latest completed exercise session, with an
+  explanation, optional blank-field filling, and saved template overrides.
 - Draft/completed session states, stored in Supabase after Save Workout.
 - Mountain Time dates and the 16-week program labels, including recovery weeks
   4, 8, 12 and a week-16 assessment label. Labels do not alter lifting targets.
@@ -64,12 +66,33 @@ the four expected nutrition tables, each with a user ID and RLS enabled. The
 workout migration was applied successfully to the existing Supabase project on
 October 11, 2026. Run it separately when setting up another database project.
 
+## Suggested weights
+
+Suggested weights use completed sets and recorded RIR, without estimating a
+one-rep maximum. Repeated challenging loads are preferred over easy ramp-up sets.
+A single heavier top set or a set at zero RIR yields a more conservative starting
+load. Increases require all prescribed sets at the rep ceiling, 2-4 RIR, unchanged
+rep/set targets, and an available increment no greater than 10 percent. Missing
+RIR, incomplete sets, and recovery weeks do not trigger increases. Squat/lunge/
+step-up suggestions flag a previous session knee score of 3 or higher and block
+automatic progression; this session-level flag does not identify a pain trigger.
+
+These are adjustable heuristics, not measured capacity or a technique assessment.
+Bodyweight/assistance and timed work are held steady. Unlogged exercises get no
+invented starting weight. Dumbbell loads are per hand; cable notes retain cable
+units. Use the same exercise variation and machine as the reference session.
+
+Each exercise shows the suggestion and its dated reference in the workout logger.
+Use Suggested Weights fills only blank, uncompleted weight fields; it does not
+save a workout or fill repetitions or completion flags. Templates offers optional
+Start lb and Step lb columns. Clearing Start lb restores automatic suggestions.
+No additional tables or migrations are needed.
+
 ## Next increments
 
 1. **Progress monitoring:** metrics from completed sets, comparable-exercise
-   charts, volume trends, records, and four-week summaries. Handle timed,
-   bodyweight and assisted exercises separately from loaded lifts. Add a technique
-   rating before using RIR and reps to suggest progression; never auto-apply it.
+   charts, volume trends, records, and four-week summaries. Extend the current
+   suggestions with technique ratings; keep progression under user control.
 2. **Integration:** combine weekly nutrition/body-weight aggregates with training
    performance, then add editable phase dates and saved phase-specific nutrition
    targets without replacing the existing active macro goal.

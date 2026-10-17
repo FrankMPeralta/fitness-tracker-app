@@ -49,7 +49,7 @@ class Query:
         return self
 
     def order(self, key, **kwargs):
-        self.orders.append(key)
+        self.orders.append((key, kwargs.get('desc', False)))
         return self
 
     def range(self, start, end):
@@ -75,6 +75,14 @@ class Query:
 
     def execute(self):
         table = self.client.tables[self.name]
+        if self.join:
+            joined = []
+            for row in table:
+                parent = next((s for s in self.client.tables['workout_sessions'] if s['id'] == row['session_id']), None)
+                if parent:
+                    joined.append(dict(row, workout_sessions=parent, **{
+                        f'workout_sessions.{k}': v for k, v in parent.items()}))
+            table = joined
         selected = [row for row in table if all(f(row) for f in self.filters)]
         if self.operation in ('insert', 'upsert'):
             for payload in self.payload if isinstance(self.payload, list) else [self.payload]:
@@ -86,10 +94,7 @@ class Query:
         elif self.operation == 'update':
             for row in selected:
                 row.update(deepcopy(self.payload))
-        elif self.join:
-            # Previous-performance join is covered separately by database/API checks.
-            selected = []
         else:
-            for key in reversed(self.orders):
-                selected.sort(key=lambda r: r[key])
+            for key, descending in reversed(self.orders):
+                selected.sort(key=lambda r: r['workout_sessions']['performed_date'] if key == 'workout_sessions(performed_date)' else r[key], reverse=descending)
         return SimpleNamespace(data=deepcopy(selected[self.start:self.end + 1]))

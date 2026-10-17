@@ -6,6 +6,7 @@ from uuid import uuid4
 
 import pandas as pd
 import streamlit as st
+from workout_suggestions import number, suggest_weight, weight_label
 
 PROGRAM_START = date(2026, 10, 12)
 PROGRAM_END = date(2027, 1, 31)
@@ -102,6 +103,9 @@ def validate_prescription(items: list[dict]) -> None:
         low, high = item.get('rep_min'), item.get('rep_max')
         if (low is None) != (high is None) or (low is not None and not 1 <= low <= high <= 100):
             raise ValueError('Rep ranges must be between 1 and 100, or both blank for timed work.')
+        for field in ('suggested_weight_lbs', 'weight_increment_lbs'):
+            if item.get(field) is not None and (number(item[field]) is None or (field == 'weight_increment_lbs' and number(item[field]) == 0)):
+                raise ValueError('Starting weights must be nonnegative and weight increments must be positive.')
 
 
 def validate_sets(sets: list[dict], completed: bool, items: list[dict]) -> None:
@@ -128,10 +132,10 @@ def validate_sets(sets: list[dict], completed: bool, items: list[dict]) -> None:
 def previous_sets(client, user_id: str, exercise_id: str, before: date, session_id: str) -> tuple[str, list[dict]]:
     # Join only this exercise's completed sets, then locate the latest earlier session.
     result = client.table('workout_sets').select(
-        '*,workout_sessions!inner(performed_date)'
+        '*,workout_sessions!inner(performed_date,knee_discomfort,prescription,status)'
     ).eq('user_id', user_id).eq('exercise_id', exercise_id).eq('completed', True).neq(
         'session_id', session_id
-    ).lte('workout_sessions.performed_date', before.isoformat()).order(
+    ).eq('workout_sessions.status', 'completed').lte('workout_sessions.performed_date', before.isoformat()).order(
         'workout_sessions(performed_date)', desc=True
     ).limit(1000).execute().data or []
     if not result:
@@ -156,8 +160,29 @@ def render_logger(client, user_id: str, library: list[dict], session: dict) -> N
         chosen = st.selectbox(f"Exercise {i + 1}", list(library_by_id),
                               index=list(library_by_id).index(item['exercise_id']),
                               format_func=lambda eid: library_by_id[eid]['name'], key=f'{key}_{i}_exercise')
+        if chosen != item['exercise_id']:
+            item.pop('suggested_weight_lbs', None)
+            item.pop('weight_increment_lbs', None)
         item.update(exercise_id=chosen, name=library_by_id[chosen]['name'])
         prescription.append(item)
+
+    references = [previous_sets(client, user_id, item['exercise_id'], performed, sid) for item in prescription]
+    suggestions = [suggest_weight(item, previous, library_by_id[item['exercise_id']].get('equipment', ''),
+                                 allow_increase='Recovery week' not in program_label(performed))
+                   for item, (_, previous) in zip(prescription, references)]
+    if any(s['weight'] is not None for s in suggestions):
+        if st.button('Use Suggested Weights', key=f'{key}_use_suggestions'):
+            for i, (item, suggestion) in enumerate(zip(prescription, suggestions)):
+                if suggestion['weight'] is None:
+                    continue
+                for n in range(1, item['set_count'] + 1):
+                    old = lookup.get((i, n), {})
+                    if old.get('exercise_id') != item['exercise_id']:
+                        old = {}
+                    prefix = f"{key}_{i}_{item['exercise_id']}_{n}"
+                    if not old.get('completed') and not st.session_state.get(f'{prefix}_done', False):
+                        if st.session_state.get(f'{prefix}_weight', old.get('weight_lbs')) is None:
+                            st.session_state[f'{prefix}_weight'] = suggestion['weight']
 
     with st.form(f'{key}_form'):
         entries = []
@@ -166,7 +191,12 @@ def render_logger(client, user_id: str, library: list[dict], session: dict) -> N
             with st.expander(f"{item['name']} · {item['set_count']} sets · {target}", expanded=(i == 0)):
                 if item.get('rep_note'):
                     st.caption(item['rep_note'])
-                prev_date, prev = previous_sets(client, user_id, item['exercise_id'], performed, sid)
+                suggestion = suggestions[i]
+                st.markdown(f"**Suggested starting weight: {weight_label(suggestion)}**")
+                st.caption(suggestion['reason'])
+                if suggestion['caution']:
+                    st.warning(suggestion['caution'])
+                prev_date, prev = references[i]
                 if prev:
                     st.caption('Previous (' + prev_date + '): ' + '; '.join(
                         f"{s['weight_lbs'] if s['weight_lbs'] is not None else 'BW / unrecorded'} lb × {s['reps'] if s['reps'] is not None else 'timed'}"
@@ -275,29 +305,43 @@ def render_templates(client, user_id: str, templates: list[dict], library: list[
         return
     key = selected or 'new'
     by_name = {e['name']: e for e in library}
-    base = [dict(Exercise=i['name'], Sets=i['set_count'], Min=i.get('rep_min'), Max=i.get('rep_max'), Notes=i.get('rep_note', '')) for i in template['exercises']]
+    base = [dict(Exercise=i['name'], Sets=i['set_count'], Min=i.get('rep_min'), Max=i.get('rep_max'),
+                 Start=i.get('suggested_weight_lbs'), Step=i.get('weight_increment_lbs'), Notes=i.get('rep_note', '')) for i in template['exercises']]
     with st.form(f'template_{key}'):
         name = st.text_input('Template name', template['name'])
         weekday = st.selectbox('Usual day', list(range(7)), index=template['weekday'], format_func=lambda n: DAYS[n])
-        edited = st.data_editor(pd.DataFrame(base, columns=['Exercise', 'Sets', 'Min', 'Max', 'Notes']),
+        edited = st.data_editor(pd.DataFrame(base, columns=['Exercise', 'Sets', 'Min', 'Max', 'Start', 'Step', 'Notes']),
             num_rows='dynamic', hide_index=True, use_container_width=True, key=f'template_editor_{key}',
             column_config={'Exercise': st.column_config.SelectboxColumn(options=list(by_name), required=True),
                            'Sets': st.column_config.NumberColumn(min_value=1, max_value=20, step=1, required=True),
                            'Min': st.column_config.NumberColumn(min_value=1, max_value=100, step=1),
-                           'Max': st.column_config.NumberColumn(min_value=1, max_value=100, step=1)})
+                           'Max': st.column_config.NumberColumn(min_value=1, max_value=100, step=1),
+                           'Start': st.column_config.NumberColumn('Start lb', min_value=0.0, step=2.5, help='Optional starting-weight override; dumbbell loads are per hand.'),
+                           'Step': st.column_config.NumberColumn('Step lb', min_value=0.5, step=0.5, help='Smallest available load increase. Default: 5 lb; for dumbbells, per hand.')})
         if st.form_submit_button('Save Template'):
             try:
                 if not name.strip():
                     raise ValueError('Enter a template name.')
                 prescription = []
-                for row in edited.to_dict('records'):
+                for position, row in enumerate(edited.to_dict('records')):
                     if row['Exercise'] not in by_name or pd.isna(row['Sets']):
                         raise ValueError('Choose an exercise and set count for every row.')
                     if any(not pd.isna(row[col]) and int(row[col]) != row[col] for col in ('Sets', 'Min', 'Max')):
                         raise ValueError('Set counts and rep ranges must be whole numbers.')
+                    start = None if pd.isna(row['Start']) else float(row['Start'])
+                    increment = None if pd.isna(row['Step']) else float(row['Step'])
+                    if position < len(template['exercises']):
+                        original = template['exercises'][position]
+                        if original['exercise_id'] != by_name[row['Exercise']]['id']:
+                            if start == original.get('suggested_weight_lbs'):
+                                start = None
+                            if increment == original.get('weight_increment_lbs'):
+                                increment = None
                     prescription.append(dict(exercise_id=by_name[row['Exercise']]['id'], name=row['Exercise'],
                         set_count=int(row['Sets']), rep_min=None if pd.isna(row['Min']) else int(row['Min']),
-                        rep_max=None if pd.isna(row['Max']) else int(row['Max']), rep_note='' if pd.isna(row['Notes']) else row['Notes']))
+                        rep_max=None if pd.isna(row['Max']) else int(row['Max']),
+                        suggested_weight_lbs=start, weight_increment_lbs=increment,
+                        rep_note='' if pd.isna(row['Notes']) else row['Notes']))
                 validate_prescription(prescription)
                 payload = dict(user_id=user_id, name=name.strip(), weekday=weekday, exercises=prescription)
                 if selected:
